@@ -156,6 +156,8 @@ class GameProbeOrchestratorTests(unittest.TestCase):
             )
             self.assertEqual(marker["target_duration_seconds"], 60)
             self.assertEqual(marker["match_result"], "unknown")
+            self.assertEqual(marker["match_finish_source"], "MATCH_FINISHED")
+            self.assertEqual(marker["match_result_source"], "unknown")
 
 
 if __name__ == "__main__":

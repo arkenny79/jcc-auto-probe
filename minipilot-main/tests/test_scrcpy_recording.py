@@ -60,6 +60,7 @@ class ScrcpyDiscoveryTests(unittest.TestCase):
     def test_windows_uses_bundled_executable(self) -> None:
         with (
             patch("app_collector.sys.platform", "win32"),
+            patch("app_collector.Path.is_file", return_value=True),
             patch("app_collector.shutil.which") as which,
         ):
             result = ADBHelper.find_scrcpy()
@@ -67,6 +68,17 @@ class ScrcpyDiscoveryTests(unittest.TestCase):
         self.assertIsNotNone(result)
         self.assertEqual(Path(result or "").name, "scrcpy.exe")
         which.assert_not_called()
+
+    def test_windows_falls_back_to_path_without_bundled_binary(self) -> None:
+        native_scrcpy = r"C:\tools\scrcpy.exe"
+        with (
+            patch("app_collector.sys.platform", "win32"),
+            patch("app_collector.Path.is_file", return_value=False),
+            patch("app_collector.shutil.which", return_value=native_scrcpy) as which,
+        ):
+            result = ADBHelper.find_scrcpy()
+        self.assertEqual(result, native_scrcpy)
+        which.assert_called_once_with("scrcpy.exe")
 
     def test_macos_ignores_bundled_windows_executable(self) -> None:
         native_scrcpy = "/opt/homebrew/bin/scrcpy"

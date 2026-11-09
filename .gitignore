@@ -44,6 +44,17 @@ logs/
 minipilot-main/tools/untrunc/
 minipilot-main/unicapture/scrcpy/
 *.zip
+*.pt
+*.pth
+*.onnx
+game-agent/wzry/.python310/
+game-agent/wzry/scrcpy-win64-v2.0/
+game-agent/wzry/models/
+game-agent/wzry/human_data/
+game-agent/wzry/pic/
+game-agent/wzry/release_packages/
+game-agent/wzry/*checkpoint*.png
+game-agent/wzry/fast_path_verify.png
 
 # 运行期截图
 **/images/screenshots/

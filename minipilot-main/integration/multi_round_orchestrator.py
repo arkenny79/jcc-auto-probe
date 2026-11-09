@@ -11,25 +11,12 @@ from datetime import datetime
 from pathlib import Path
 from typing import Sequence
 
+from integration.game_profiles import GAME_PROFILES
 
-DEFAULT_FIRST_ROUND_GOAL = (
-    "打开金铲铲之战，处理登录、隐私协议、公告、活动弹窗、权限提示和更新提示。"
-    "进入游戏大厅后，选择标准排位模式并开始匹配；出现接受对局时点击接受；"
-    "进入对局后立即停止。不要购买英雄、刷新商店、选择强化、支付、充值、"
-    "账号绑定或发送消息。"
-)
 
-DEFAULT_POSTGAME_GOAL = (
-    "当前处于上一局结算页面。返回游戏大厅，然后重新选择标准排位模式并开始匹配；"
-    "出现接受对局时点击接受；进入下一局后立即停止。不要点击购买、充值、"
-    "账号绑定或发送消息。"
-)
-
-DEFAULT_RECOVERY_GOAL = (
-    "当前页面状态未知。先关闭公告、活动、更新、权限或网络提示，恢复到金铲铲"
-    "游戏大厅；然后选择标准排位模式并开始匹配；出现接受对局时点击接受；"
-    "进入对局后立即停止。遇到登录、验证码、支付或账号安全页面时停止并请求人工接管。"
-)
+DEFAULT_FIRST_ROUND_GOAL = GAME_PROFILES["jcc"]["first_goal"]
+DEFAULT_POSTGAME_GOAL = GAME_PROFILES["jcc"]["postgame_goal"]
+DEFAULT_RECOVERY_GOAL = GAME_PROFILES["jcc"]["recovery_goal"]
 
 
 class MultiRoundError(RuntimeError):
@@ -40,7 +27,7 @@ def parse_args(argv: Sequence[str] | None = None):
     parser = argparse.ArgumentParser(
         prog="multi-round-orchestrator",
         description=(
-            "Run sequential Jin Chan Chan rounds. Wrapper options are parsed "
+            "Run sequential game-probe rounds. Wrapper options are parsed "
             "here; all unknown arguments are passed to game_probe_orchestrator."
         ),
     )
@@ -48,8 +35,10 @@ def parse_args(argv: Sequence[str] | None = None):
     parser.add_argument("--round-delay", type=float, default=10.0)
     parser.add_argument("--session-id", default=None)
     parser.add_argument("--runs-dir", default="runs")
-    parser.add_argument("--postgame-goal", default=DEFAULT_POSTGAME_GOAL)
-    parser.add_argument("--recovery-goal", default=DEFAULT_RECOVERY_GOAL)
+    parser.add_argument("--game-id", default="jcc", choices=tuple(GAME_PROFILES))
+    parser.add_argument("--pregame-goal", default=None)
+    parser.add_argument("--postgame-goal", default=None)
+    parser.add_argument("--recovery-goal", default=None)
     parser.add_argument("--max-round-retries", type=int, default=1)
     parser.add_argument("--dry-run", action="store_true")
     return parser.parse_known_args(argv)
@@ -77,16 +66,18 @@ def _build_round_command(
     round_index: int,
     session_id: str,
     pregame_goal: str,
+    game_id: str = "jcc",
 ) -> list[str]:
     cleaned_args = _remove_option(base_args, "--run-id")
     cleaned_args = _remove_option(cleaned_args, "--pregame-goal")
+    cleaned_args = _remove_option(cleaned_args, "--game-id")
     command = [
         sys.executable,
         "-m",
         "integration.game_probe_orchestrator",
         *cleaned_args,
     ]
-    command.extend(["--run-id", f"{session_id}-r{round_index}"])
+    command.extend(["--game-id", game_id, "--run-id", f"{session_id}-r{round_index}"])
     command.extend(["--pregame-goal", pregame_goal])
     if round_index > 1:
         command.append("--skip-launch-game")
@@ -120,12 +111,18 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.max_round_retries < 0:
         raise SystemExit("--max-round-retries cannot be negative")
 
+    profile = GAME_PROFILES[args.game_id]
+    passthrough = _replace_option_value(
+        passthrough, "--runs-dir", str(Path(args.runs_dir).resolve())
+    )
+
     session_id = args.session_id or datetime.now().strftime("%Y%m%d-%H%M%S")
     session_dir = Path(args.runs_dir) / f"{session_id}-multi-round"
     session_dir.mkdir(parents=True, exist_ok=True)
     manifest_path = session_dir / "session_manifest.json"
     manifest = {
         "session_id": session_id,
+        "game_id": args.game_id,
         "rounds_requested": args.rounds,
         "rounds": [],
         "status": "running",
@@ -134,15 +131,16 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     for round_index in range(1, args.rounds + 1):
         pregame_goal = (
-            DEFAULT_FIRST_ROUND_GOAL
+            (args.pregame_goal or profile["first_goal"])
             if round_index == 1
-            else args.postgame_goal
+            else (args.postgame_goal or profile["postgame_goal"])
         )
         command = _build_round_command(
             base_args=passthrough,
             round_index=round_index,
             session_id=session_id,
             pregame_goal=pregame_goal,
+            game_id=args.game_id,
         )
         round_log = session_dir / f"round-{round_index:02d}.log"
         round_record = {
@@ -176,8 +174,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                     attempt_command,
                     "--pregame-goal",
                 )
+                recovery_goal = args.recovery_goal or profile["recovery_goal"]
                 attempt_command.extend(
-                    ["--skip-launch-game", "--pregame-goal", args.recovery_goal]
+                    ["--skip-launch-game", "--pregame-goal", recovery_goal]
                 )
             round_record["attempt"] = attempt
             _write_session_manifest(manifest_path, manifest)
@@ -212,7 +211,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         if round_index < args.rounds:
             time.sleep(args.round_delay)
 
-    manifest["status"] = "ok"
+    manifest["status"] = "dry_run" if args.dry_run else "ok"
     _write_session_manifest(manifest_path, manifest)
     print(f"Session manifest: {manifest_path}")
     return 0

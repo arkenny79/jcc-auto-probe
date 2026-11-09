@@ -1,228 +1,105 @@
-# 金铲铲之战 自动化拨测与 QoE 卡顿检测（统一工程）
+# 多游戏自动拨测：金铲铲之战与王者荣耀
 
-把「Android 自动化采集与后处理工程」与「金铲铲对局执行器」串成**一条命令即可跑完**的自动拨测流水线：
+本仓库将两款游戏作为同一个自动拨测项目下的独立执行器，共用设备绑定、采集、生命周期事件、单轮/多轮编排和报告。仓库名暂时保留 `jcc-auto-probe`，原有金铲铲入口继续使用。
 
-```text
-启动采集 -> 启动游戏 -> 前置 Agent 处理登录/公告/大厅/匹配/接受对局
-        -> MATCH_READY -> 对局执行器接管 -> MATCH_FINISHED
-        -> 停止采集 -> 自动 QoE 后处理 -> 输出统一 manifest.json
-```
+**当前版本：2026-11-09 整合版。代码接入不等于实机验收。** 本次完成离线测试和启动命令检查，尚未在整合后的仓库重新跑实机全流程。首次部署需要另外准备配置、外部工具和王者模型。各功能的实现情况、历史证据和未验证项见 [实现与验证状态](docs/IMPLEMENTATION_STATUS.md)。
 
-核心不是重写任何一侧，而是新增一层**跨进程的协议与编排**：用 JSONL 事件把「不确定的页面导航」「确定性的对局操作」「被动的数据采集」对齐到同一条业务时间轴上。
-
-## 仓库结构
+## 工程结构
 
 ```text
-jcc-auto-probe/
-├── README.md                       本说明
-├── docs/
-│   ├── 架构与技术路线.md            分层架构图、流程、各模块技术选型
-│   ├── 对接任务清单与实施指南.md      双方接口契约与验收标准
-│   └── 组会汇报-项目工作日志.md       实机联调记录与当前进展
-├── minipilot-main/                 采集与总控工程（MiniPilot + Unicapture）
-│   ├── integration/                ★ 统一总控层（本次新增）
-│   ├── mini_pilot/                 前置视觉 Agent、ADB 设备控制、采集会话
-│   └── unicapture/                 录屏 / 抓包 / logcat / 实时 QoE / 后处理
-└── game-agent/                     对局执行工程
-    ├── jinchanchan/                金铲铲对局执行器（auto_loop.py）
-    └── scheduler/                  多游戏统一调度器（预留）
+minipilot-main/
+  integration/
+    game_profiles.py             两款游戏的包名、入口和前置目标
+    game_probe_orchestrator.py    单轮编排
+    multi_round_orchestrator.py   同一游戏的多轮编排与重试
+    probe_report.py               按游戏生成报告
+  mini_pilot/                    前置视觉 Agent、设备与采集接口
+  unicapture/                    录屏、抓包、QoE 和后处理
+game-agent/
+  jinchanchan/                    金铲铲执行器及启动脚本
+  wzry/                          王者执行器、OCR 前置导航及启动脚本
+  scheduler/                     历史跨游戏调度实验，默认 DRY_RUN
+docs/                            架构、验证状态、来源与历史记录
 ```
 
-## 系统架构
+共用流程：启动采集 → 启动游戏/前置导航 → `MATCH_READY` → 对局执行 → `MATCH_FINISHED` → 停止采集 → 后处理 → `manifest.json` 和 `report.md`。
 
-```text
-┌───────────────────────────────────────────────────────────────────────────┐
-│ L1 编排层  minipilot-main/integration/                                     │
-│   game_probe_orchestrator.py   单轮总控状态机（主入口）                      │
-│   multi_round_orchestrator.py  多轮串行会话编排                             │
-│   game_events.py               JSONL 事件尾部读取 + seq 校验                │
-│   game_driver.py               对局器进程适配（stop-file / 退出码）          │
-│   pregame_agent.py             前置 Agent 进程适配（live-command /stop）     │
-└──────┬────────────────┬────────────────────┬────────────────────┬─────────┘
-       │ subprocess     │ subprocess         │ subprocess         │ 文件事件
-       ▼                ▼                    ▼                    ▼
-┌─────────────┐  ┌──────────────┐  ┌─────────────────┐  ┌──────────────────┐
-│ L2 前置交互  │  │ L3 对局执行   │  │ L4 采集          │  │ L5 状态通道       │
-│ mini_pilot/ │  │ jinchanchan/ │  │ unicapture/     │  │ events/*.jsonl   │
-│ Seed 2.0 Pro│  │ auto_loop    │  │ app_collector   │  │ control/*.stop   │
-│ ADB 操作     │  │ external     │  │ qoe_monitor     │  │ business_timing  │
-└─────────────┘  └──────────────┘  └─────────────────┘  └──────────────────┘
-                                          │
-                                          ▼
-┌───────────────────────────────────────────────────────────────────────────┐
-│ L6 后处理层  unicapture/postprocess_runner.py（四阶段隔离执行）             │
-│   ① video_timing  ② activate_time  ③ qoe（逐秒）  ④ flow_labeling        │
-└───────────────────────────────────────────────────────────────────────────┘
-                                          │
-                                          ▼
-┌───────────────────────────────────────────────────────────────────────────┐
-│ L7 产物层  runs/<run_id>/                                                 │
-│   manifest.json  events/  control/  game_driver.log  capture/<sample>/    │
-└───────────────────────────────────────────────────────────────────────────┘
-```
+金铲铲使用视觉 Agent 处理前置页面；王者默认使用 ADB、OCR 和开始识别模型进入单人练习场。两款游戏分别维护局内策略和结束判断。共用 JSONL 生命周期接口，不合并模型或 Python 运行环境。
 
-详细的分层图、控制权边界图与各模块技术选型见 [docs/架构与技术路线.md](docs/架构与技术路线.md)。
+## 部署
 
-## 工作流程
+以下命令从仓库根目录运行。当前适配目标是 Windows、PowerShell、雷电模拟器。王者已知布局为横屏 `1920x1080`；其他布局未验收。设备序列号以本机 `adb devices` 为准。
 
-| 步骤 | 动作 | 负责模块 | 产出 / 证据 |
-|---|---|---|---|
-| 0 | 设备预检：ADB 连接、`wm size`、DPI、横屏 | `mini_pilot/device.py` | `DEVICE_READY` 事件 |
-| 1 | **先启动采集**（录屏 + 抓包 + logcat + 实时 QoE） | `mini_pilot/capture.py` → `unicapture/app_collector.py` | `unicapture.ready` |
-| 2 | 启动游戏 `ZGamePolicyActivity` | `game_probe_orchestrator._launch_game` | 可 `--skip-launch-game` |
-| 3 | 启动对局器（external 等待中）+ 前置 Agent | `game_driver.py` / `pregame_agent.py` | `SCRIPT_STARTED` |
-| 4 | 前置 Agent 冷启动 → 大厅 → 匹配 → 接受对局 | `mini_pilot/agent.py` + Seed 2.0 Pro | 前置 run 目录与截图 |
-| 5 | 严格 `MATCH_READY`（连续 2 次、间隔 1.5s、合法回合） | `jinchanchan/agent/lifecycle.py` | `MATCH_READY` |
-| 6 | 写入业务开始标记（采集早于业务开始） | `game_probe_orchestrator._write_marker` | `capture/business_timing.json` |
-| 7 | `/stop` 停止前置 Agent，移交控制权 | `pregame_agent.request_stop` | `live_commands.jsonl` |
-| 8 | 对局内操作 + 阶段事件 | `jinchanchan/auto_loop.py` | `ROUND_PHASE`（buy/battle/carousel/augment） |
-| 9 | 自然结算，立即停止游戏输入 | `lifecycle.parse_match_result` | `MATCH_FINISHED`（result/placement） |
-| 10 | 更新业务结束标记 → 停对局器 → 停采集 | `game_events.py` / `capture.stop()` | `SCRIPT_STOPPED` |
-| 11 | 自动后处理四阶段 | `unicapture/postprocess_runner.py` | `postprocess/summary.json` |
-| 12 | 写统一清单 | `game_probe_orchestrator._write_manifest` | `manifest.json` |
-
-## 接口契约
-
-**事件协议（权威状态通道，JSONL）**
-
-```json
-{"schema_version":1,"run_id":"run-1","seq":1,"ts":"2026-09-29T21:00:00+08:00","event":"SCRIPT_STARTED"}
-{"schema_version":1,"run_id":"run-1","seq":4,"ts":"2026-09-29T21:00:03+08:00","event":"MATCH_READY","round":"2-2"}
-{"schema_version":1,"run_id":"run-1","seq":5,"ts":"2026-09-29T21:01:03+08:00","event":"MATCH_FINISHED","result":"loss","placement":6}
-{"schema_version":1,"run_id":"run-1","seq":6,"ts":"2026-09-29T21:01:04+08:00","event":"SCRIPT_STOPPED","reason":"match_finished"}
-```
-
-- `seq` 严格递增；`MATCH_READY` / `MATCH_FINISHED` 每次运行最多各一次；`SCRIPT_STOPPED` 必须是最后一条。
-- 事件文件先写临时文件再原子替换，总控只读事件文件，不解析 stdout。
-
-**退出码**
-
-```text
-0 正常结束   1 业务失败   2 参数或环境错误   3 外部停止文件触发   4 超时退出
-```
-
-**时间语义**
-
-```text
-CAPTURE_STARTED  <  MATCH_READY  <=  MATCH_FINISHED  <  CAPTURE_STOPPED  <  POSTPROCESS_FINISHED
-```
-
-业务时长只由 `MATCH_READY → MATCH_FINISHED` 计算，登录、公告、匹配时间不计入对局业务时间。
-
-**控制权边界**
-
-```text
-外部总控    ：启动游戏、登录/公告/大厅/匹配/接受对局、启动与停止采集
-对局执行器  ：MATCH_READY 之后执行对局操作；MATCH_FINISHED 之后立即停止输入
-外部总控    ：停止采集、QoE 后处理、输出统一报告
-```
-
-## 快速开始
-
-**环境要求**
-
-```text
-Windows + PowerShell
-Python 3.12
-LDPlayer 14（横屏 1920x1080，DPI 280）
-ADB：D:\leidian\LDPlayer14\adb.exe
-设备：127.0.0.1:5555（游戏包名 com.tencent.jkchess）
-```
-
-**1. 采集工程**
+1. 安装采集环境和本地配置：
 
 ```powershell
-cd .\minipilot-main
-py -3.12 -m venv .venv
-& .\.venv\Scripts\python.exe -m pip install -r requirements.txt
-Copy-Item .\mini_pilot.config.example.json .\mini_pilot.config.json
-# 在 mini_pilot.config.json 中填入自己的 API Key（该文件已被 .gitignore 排除）
+py -3.12 -m venv .\minipilot-main\.venv
+& .\minipilot-main\.venv\Scripts\python.exe -m pip install -r .\minipilot-main\requirements.txt
+Copy-Item .\minipilot-main\mini_pilot.config.example.json .\minipilot-main\mini_pilot.config.json
+# 修改自己的配置，已有配置时不要重复覆盖。
 ```
 
-**2. 对局执行工程**
+2. 安装金铲铲环境：
 
 ```powershell
-cd ..\game-agent\jinchanchan
-python -m pip install -r requirements.txt
+py -3.12 -m venv .\game-agent\.venv
+& .\game-agent\.venv\Scripts\python.exe -m pip install -r .\game-agent\jinchanchan\requirements.txt
 ```
 
-**3. 单条命令跑一轮完整拨测**
+3. 王者使用独立 Python 3.10 环境。依赖、模型清单和校验方法见 [王者部署说明](game-agent/wzry/README.md)。仅运行金铲铲时不需要安装王者依赖。
+
+4. 配置 ADB，准备 scrcpy、FFmpeg 和设备侧采集工具。无 Root 抓包需要项目配套的定制 PCAPdroid；有 Root 的设备可按采集工程说明使用 tcpdump。具体配置见 [采集工程说明](minipilot-main/README.md)。这些工具不通过 pip 自动安装，也不包含在本次上传中。
 
 ```powershell
-cd .\minipilot-main
-$adb = "D:\leidian\LDPlayer14\adb.exe"
-
-& .\.venv\Scripts\python.exe -m integration.game_probe_orchestrator `
-  --config .\mini_pilot.config.json `
-  --adb $adb `
-  --device-id 127.0.0.1:5555 `
-  --game-python "..\game-agent\.venv\Scripts\python.exe" `
-  --game-driver "..\game-agent\jinchanchan\auto_loop.py" `
-  --game-directory "..\game-agent\jinchanchan" `
-  --run-id my-full-test `
-  --game-timeout 3600 `
-  --capture-ceiling 3900 `
-  --match-ready-timeout 900 `
-  --pregame-timeout 600 `
-  --pregame-max-loops 40 `
-  --business-duration 2400 `
-  --postprocess-ocr-every 10 `
-  --capture-app jcc `
-  --capture-scene battle `
-  --capture-pcap-mode standard `
-  --profile seed2pro
+$env:MINI_PILOT_ADB_BIN = 'D:\leidian\LDPlayer14\adb.exe' # 按本机路径修改
+& $env:MINI_PILOT_ADB_BIN devices
 ```
 
-**4. 多轮连续拨测**
+两个启动脚本默认使用本仓库的 `minipilot-main`；`MINI_PILOT_ROOT` 可覆盖采集工程目录。检查旧环境变量，避免意外运行到旧部署。`-GamePython` 可覆盖对应游戏的解释器。
+
+## 运行入口
+
+先预览命令。`-DryRun` 不启动游戏、不连接设备、不执行采集，也不代表依赖检查通过：
 
 ```powershell
-& .\.venv\Scripts\python.exe -m integration.multi_round_orchestrator `
-  --rounds 3 --round-delay 10 --session-id jcc-session-01 `
-  --config .\mini_pilot.config.json --adb $adb --device-id 127.0.0.1:5555 `
-  --game-python "..\game-agent\.venv\Scripts\python.exe" `
-  --game-driver "..\game-agent\jinchanchan\auto_loop.py" `
-  --game-directory "..\game-agent\jinchanchan"
+.\game-agent\jinchanchan\run_capture_probe.ps1 -DryRun -RunId jcc-preview
+.\game-agent\wzry\run_capture_probe.ps1 -DryRun -RunId wzry-preview
 ```
 
-## 产物目录
+准备好环境后运行一轮，示例设备号需按本机修改：
 
-```text
-runs/<run_id>/
-├── manifest.json                 本次运行总清单（状态、业务时间、退出码）
-├── events/game_driver.jsonl      对局器事件流（权威状态通道）
-├── control/stop.game             外部停止标记
-├── game_driver.log               对局器完整日志
-├── pregame_agent.log             前置 Agent 日志
-└── capture/
-    ├── business_timing.json      业务开始/结束标记
-    └── <sample>/
-        ├── *.mp4  *.pcap  *.log  *.yaml
-        ├── *_qoe.csv  *_sa.csv  *_flow_labeled.csv
-        └── postprocess/summary.json
+```powershell
+.\game-agent\jinchanchan\run_capture_probe.ps1 -DeviceId '127.0.0.1:5555' -RunId jcc-round-01
+.\game-agent\wzry\run_capture_probe.ps1 -DeviceId 'emulator-5554' -RunId wzry-round-01
 ```
 
-## 当前状态
+同一模拟器上依次运行，等待上一条结束。金铲铲默认目标为标准排位；王者默认目标为单人练习场。真实登录、验证码、实名和账号安全页面需人工处理；已登录状态可以尝试从“开始游戏”进入大厅。
 
-已实机跑通：
+同一游戏的多轮入口已有实现，**王者自动连续两轮尚待本版本实机验收**：
 
-- 外部总控 + Unicapture + 金铲铲 external 的完整链路：`MATCH_READY → 采集 → MATCH_FINISHED → 后处理 → summary.json`。
-- 冷启动前置流程：桌面启动 → 前置 Agent 匹配/接受对局 → 对局器接管 → 自然结算。
-- 结算结果已可输出 `result` 与 `placement`（实测 `loss` / 第 6 名）。
-- 2026-10-27 最新实机记录：自然结算第 6 名，采集与结算后处理完成；结算后未能稳定返回大厅，因此多轮连续流程仍未验证通过。
+```powershell
+.\game-agent\wzry\run_capture_probe.ps1 -Rounds 2 -SessionId wzry-two-rounds
+.\game-agent\jinchanchan\run_capture_probe.ps1 -Rounds 2 -SessionId jcc-two-rounds
+```
 
-已知限制：
+多轮编排在上一轮结束后使用结算返回目标，失败时切换恢复目标；重试耗尽就停止。它不等于无人值守可靠性已验证，也不提供两款游戏自动交替调度。使用不同的运行/会话标识保存每次实验。
 
-- 结算后的返回大厅/重新匹配链路尚不稳定；该问题尚未修复或复测，不应视为完整多轮闭环。
-- 登录、公告、广告、权限弹窗仅在已登录态下验证，未真正触发过。
-- 后处理依赖 `ffprobe`，缺失时保留 MKV，MP4 校验不完整。
-- 模型调用依赖网络，离线环境无法完成完整拨测。
-- 前置页面采用「UI 控件 → OCR → 模板匹配 → 视觉模型 → 人工接管」的回退顺序，登录/验证码/实名等默认转人工。
+## 结果与判断
 
-## 子工程来源
+默认产物位于 `minipilot-main/runs/<run_id>-<game_id>-external/`：
 
-| 目录 | 来源 | 说明 |
-|---|---|---|
-| `minipilot-main/` | 本地自动化采集工程 | MiniPilot + Unicapture，含本阶段新增的 `integration/` 总控层 |
-| `game-agent/jinchanchan/` | 金铲铲对局执行器 | 原 `Game-Agent` 仓库的 jinchanchan 子工程，已补 external 模式与生命周期接口 |
+- `manifest.json`：运行、采集、后处理状态及结束来源。
+- `events/game_driver.jsonl`：权威生命周期事件；不要用普通输出日志替代。
+- `capture/`：视频、抓包、逐秒 QoE、流级结果和后处理摘要。
+- `report.md`：按游戏生成的中文汇总，标记缺失产物与后处理问题。
 
-`Game-Agent` 中的 `wzry/`（王者荣耀，约 5.9 GB）与本项目无关，未纳入本仓库。
+多轮会话另有 `<session_id>-multi-round/session_manifest.json`。`status=ok` 表示流程正常返回，仍需检查采集文件、后处理状态和告警；`result=unknown` 不代表胜负已识别。指标文件的存在也不等于质量准确性验收。
+
+## 文档与来源
+
+- [实现与验证状态](docs/IMPLEMENTATION_STATUS.md)：本次验证记录、未验证/未实现列表及下一步验收。
+- [王者采集接口](game-agent/wzry/CAPTURE_INTEGRATION.md)：事件、控制权和结果语义。
+- [来源说明](docs/SOURCE_NOTES.md)：迁入版本、上游署名及模型发布状态。
+- [原金铲铲文档](docs/JCC_LEGACY.md)、[架构与技术路线](docs/架构与技术路线.md)、[历史工作日志](docs/组会汇报-项目工作日志.md)：保留研究过程；部署与当前完成度以本页和状态表为准。
+
+源码和必要的小型识别素材入库；密钥配置、虚拟环境、模型、录屏、抓包、日志和运行数据不入库。

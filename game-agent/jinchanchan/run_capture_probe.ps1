@@ -7,7 +7,8 @@ param(
     [int]$PostprocessOcrEvery = 10,
     [string]$SessionId = "",
     [string]$DeviceId = "127.0.0.1:5555",
-    [string]$PregameGoal = "打开金铲铲之战，处理登录、隐私协议、公告、活动弹窗、权限提示和更新提示。进入游戏大厅后，选择标准排位模式并开始匹配；出现接受对局时点击接受；进入对局后立即停止。不要购买英雄、刷新商店、选择强化、支付、充值、账号绑定或发送消息。",
+    [string]$GamePython = "",
+    [string]$PregameGoal = "",
     [switch]$DisablePostprocess,
     [switch]$DryRun
 )
@@ -24,25 +25,28 @@ $CaptureRoot = if ($env:MINI_PILOT_ROOT) {
     Join-Path $RepoRoot "minipilot-main"
 }
 $CapturePython = Join-Path $CaptureRoot ".venv\Scripts\python.exe"
-$GamePython = Join-Path $RepoRoot "game-agent\.venv\Scripts\python.exe"
+if (-not $GamePython) {
+    $GamePython = Join-Path $RepoRoot "game-agent\.venv\Scripts\python.exe"
+}
 $Adb = if ($env:MINI_PILOT_ADB_BIN) {
     $env:MINI_PILOT_ADB_BIN
 } else {
     $adbCommand = Get-Command adb.exe -ErrorAction SilentlyContinue
-    if (-not $adbCommand) {
+    if (-not $adbCommand -and -not $DryRun) {
         throw "Set MINI_PILOT_ADB_BIN or add adb.exe to PATH."
     }
-    $adbCommand.Source
+    if ($adbCommand) { $adbCommand.Source } else { "adb.exe" }
 }
 $Config = Join-Path $CaptureRoot "mini_pilot.config.json"
 
+if (-not $DryRun) {
 foreach ($required in @($CapturePython, $GamePython, $Adb, $Config)) {
     if (-not (Test-Path -LiteralPath $required)) {
         throw "Missing required file: $required"
     }
 }
 
-& $Adb connect $DeviceId 2>$null | Out-Null
+if ($DeviceId -match ':') { & $Adb connect $DeviceId 2>$null | Out-Null }
 $deviceReady = $false
 for ($attempt = 1; $attempt -le 4; $attempt++) {
     $devices = & $Adb devices 2>$null
@@ -54,6 +58,7 @@ for ($attempt = 1; $attempt -le 4; $attempt++) {
 }
 if (-not $deviceReady) {
     throw "ADB device $DeviceId is not ready. Start LDPlayer and retry."
+}
 }
 
 $module = if ($Rounds -gt 1) {
@@ -81,9 +86,9 @@ $arguments = @(
     "--capture-skip-pcapdroid-preflight",
     "--postprocess-ocr-every", "$PostprocessOcrEvery",
     "--game-package", "com.tencent.jkchess",
-    "--game-launch-activity", "com.tencent.gcloud.msdk.core.policy.ZGamePolicyActivity",
-    "--pregame-goal", $PregameGoal
+    "--game-launch-activity", "com.tencent.gcloud.msdk.core.policy.ZGamePolicyActivity"
 )
+if ($PregameGoal) { $arguments += @("--pregame-goal", $PregameGoal) }
 
 if ($Rounds -gt 1) {
     $arguments += @("--rounds", "$Rounds")

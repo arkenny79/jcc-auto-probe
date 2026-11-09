@@ -15,6 +15,7 @@ import numpy as np
 LATENCY_RE = re.compile(r"(?<!\d)(\d{1,4})\s*m\s*s\b", re.IGNORECASE)
 RESOLUTION_RE = re.compile(r"(?<!\d)(2160|1080|720|540|480)\s*[pP]?\b")
 LOADING_WORDS = ("加载", "缓冲", "连接中", "loading", "buffering", "connecting")
+MAX_PLAUSIBLE_LATENCY_MS = 2000
 
 
 @dataclass(frozen=True)
@@ -28,7 +29,7 @@ class Perception:
 
 
 class OCRPerception:
-    def __init__(self):
+    def __init__(self, app_name: Optional[str] = None, scene: Optional[str] = None):
         try:
             from rapidocr_onnxruntime import RapidOCR
         except ImportError as exc:
@@ -36,6 +37,12 @@ class OCRPerception:
         self._engine = RapidOCR()
         self._latency_roi: Optional[tuple[float, float, float, float]] = None
         self.tracked_only = False
+        self.app_name = (app_name or "").strip().lower()
+        self.scene = (scene or "").strip().lower()
+        if self.app_name == "honorofkings":
+            # In-game network latency sits in the top-right status bar.
+            self._latency_roi = (0.775, 0.005, 0.855, 0.045)
+            self.tracked_only = True
 
     @property
     def has_latency_roi(self) -> bool:
@@ -51,16 +58,31 @@ class OCRPerception:
                 scale = target_height / max(1, crop.shape[0])
                 crop = cv2.resize(crop, (max(1, int(crop.shape[1] * scale)), target_height))
                 results, _ = self._engine(crop, use_det=False, use_cls=False)
-                if results:
-                    text = str(results[0][0]).strip()
-                    confidence = float(results[0][1])
+                for item in results or []:
+                    if not isinstance(item, (list, tuple)) or not item:
+                        continue
+                    if isinstance(item[0], str):
+                        text = str(item[0]).strip()
+                        confidence = float(item[1]) if len(item) > 1 else 0.0
+                    elif len(item) >= 3:
+                        text = str(item[1]).strip()
+                        confidence = float(item[2])
+                    else:
+                        continue
                     match = LATENCY_RE.search(text.replace("毫秒", "ms"))
                     if match:
                         value = int(match.group(1))
-                        if 1 <= value <= 9999:
+                        if 1 <= value <= MAX_PLAUSIBLE_LATENCY_MS:
                             return Perception(texts=(text,), latency_ms=value, ocr_confidence=confidence)
                 if self.tracked_only:
-                    texts = tuple(str(item[0]).strip() for item in (results or []))
+                    texts = tuple(
+                        str(item[0]).strip()
+                        if isinstance(item[0], str)
+                        else str(item[1]).strip()
+                        for item in (results or [])
+                        if isinstance(item, (list, tuple)) and item
+                        and (isinstance(item[0], str) or len(item) >= 2)
+                    )
                     return Perception(texts=texts)
 
         results, _ = self._engine(image)
@@ -93,7 +115,7 @@ class OCRPerception:
             cleaned = text.replace("毫秒", "ms")
             for match in LATENCY_RE.finditer(cleaned):
                 value = int(match.group(1))
-                if 1 <= value <= 9999:
+                if 1 <= value <= MAX_PLAUSIBLE_LATENCY_MS:
                     latency_candidates.append((confidence, value))
                     points = item[0]
                     xs = [float(point[0]) for point in points]

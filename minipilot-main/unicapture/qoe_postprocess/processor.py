@@ -174,7 +174,7 @@ def process_sample(
         progress_callback=frame_progress,
     )
     print("[qoe-postprocess] 阶段 3/3：逐秒识别并生成QoE", flush=True)
-    ocr = OCRPerception()
+    ocr = OCRPerception(app_name=sample.app_name, scene=sample.scene)
     # Post-processing may use a later native screenshot to learn a stable OCR
     # region. Only its geometry is retained; its numeric value is not copied to
     # any other second.

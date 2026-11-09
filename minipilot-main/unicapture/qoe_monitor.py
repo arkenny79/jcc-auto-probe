@@ -39,12 +39,33 @@ def _adb_binary() -> str:
         or 'adb'
     )
 
+
+def _read_image(path) -> Optional[np.ndarray]:
+    """Read an image through bytes so Windows non-ASCII paths work."""
+    try:
+        raw = np.fromfile(str(path), dtype=np.uint8)
+        if raw.size == 0:
+            return None
+        return cv2.imdecode(raw, cv2.IMREAD_COLOR)
+    except (OSError, ValueError):
+        return None
+
+
 # ==================== 可选 OCR 依赖 ====================
 try:
     import pytesseract
     PYTESSERACT_AVAILABLE = True
 except ImportError:
     PYTESSERACT_AVAILABLE = False
+
+try:
+    from rapidocr_onnxruntime import RapidOCR
+    RAPIDOCR_AVAILABLE = True
+except ImportError:
+    RAPIDOCR_AVAILABLE = False
+
+LATENCY_MS_RE = re.compile(r'(?<!\d)(\d{1,4})\s*m\s*s\b', re.IGNORECASE)
+MAX_PLAUSIBLE_LATENCY_MS = 2000
 
 # ==================== APP 检测配置 ====================
 APP_DETECTION_PROFILES: Dict[str, Dict] = {
@@ -156,6 +177,24 @@ APP_DETECTION_PROFILES: Dict[str, Dict] = {
             'skip_circle_on_video_feed': True,
         }
     },
+    'honorofkings': {
+        'resolution_regions': [
+            {'name': '右下', 'bbox': (0.72, 0.85, 0.96, 0.98)},
+            {'name': '右上', 'bbox': (0.78, 0.02, 0.98, 0.15)},
+        ],
+        'resolution_keywords': {
+            '流畅': 360, '高清': 720, '超清': 1080, '蓝光': 1080, '4K': 2160,
+        },
+        'loading_cfg': {
+            # MOBA HUD contains many circles; only the strongest spinner is useful.
+            'center_roi': (0.25, 0.25, 0.75, 0.75),
+            'circle_min_radius_ratio': 0.03,
+            'circle_max_radius_ratio': 0.15,
+            'min_concentric_circles': 2,
+            'skip_circle_on_video_feed': True,
+            'skip_loading_detection': True,
+        }
+    },
     'default': {
         'resolution_regions': [
             {'name': '右下', 'bbox': (0.72, 0.85, 0.96, 0.98)},
@@ -206,7 +245,7 @@ class PageClassifier:
         if self.app_name != 'douyin':
             return 'unknown', {}
 
-        img = cv2.imread(image_path)
+        img = _read_image(image_path)
         if img is None:
             return 'unknown', {}
 
@@ -588,8 +627,11 @@ class LoadingDetector:
         Returns: (is_loading, reason)
         """
         try:
-            img = cv2.imread(image_path)
+            img = _read_image(image_path)
             if img is None:
+                return False, ""
+
+            if self.cfg.get('skip_loading_detection', False):
                 return False, ""
             
             # 非视频页面（团购/直播入口/搜索/商城等）跳过 loading_circle 检测，避免圆形UI误判
@@ -922,7 +964,7 @@ class ImageAnalyzer:
         从屏幕截图识别视频分辨率（APP分支优化版）
         """
         try:
-            img = cv2.imread(image_path)
+            img = _read_image(image_path)
             if img is None:
                 return -128
             
@@ -1159,8 +1201,8 @@ class ImageAnalyzer:
             - pixel_sim: 像素差异比例 (0-100%)，可直接用于卡顿判定
         """
         try:
-            img1 = cv2.imread(img1_path)
-            img2 = cv2.imread(img2_path)
+            img1 = _read_image(img1_path)
+            img2 = _read_image(img2_path)
             if img1 is None or img2 is None:
                 return 0.0, 0.0
             if img1.shape != img2.shape:
@@ -1202,8 +1244,8 @@ class ImageAnalyzer:
     def pixel_diff_ratio(img1_path: str, img2_path: str, threshold: int = 10) -> float:
         """计算像素差异比例"""
         try:
-            img1 = cv2.imread(img1_path)
-            img2 = cv2.imread(img2_path)
+            img1 = _read_image(img1_path)
+            img2 = _read_image(img2_path)
             if img1 is None or img2 is None:
                 return 0.0
             if img1.shape != img2.shape:
@@ -1247,6 +1289,10 @@ class QoEMonitor:
         self.manual_resolution = resolution
         self.register_signal = register_signal
         self.running = False
+        self._latency_ocr = None
+        self._latency_roi = (0.775, 0.005, 0.855, 0.045)
+        if app_name == 'honorofkings' and RAPIDOCR_AVAILABLE:
+            self._latency_ocr = RapidOCR()
         
         # pcap文件名
         if pcap_name:
@@ -1460,6 +1506,38 @@ class QoEMonitor:
         
         return valid_resolutions[-1] if valid_resolutions else -128
     
+    def _detect_latency_ms(self, screenshot_path: str) -> int:
+        if self._latency_ocr is None:
+            return -4
+        image = _read_image(screenshot_path)
+        if image is None:
+            return -4
+        height, width = image.shape[:2]
+        x1, y1, x2, y2 = self._latency_roi
+        crop = image[int(y1 * height):int(y2 * height), int(x1 * width):int(x2 * width)]
+        if crop.size == 0:
+            return -4
+        try:
+            results, _ = self._latency_ocr(crop, use_det=False, use_cls=False)
+        except Exception:
+            return -4
+        for item in results or []:
+            if not isinstance(item, (list, tuple)) or not item:
+                continue
+            if isinstance(item[0], str):
+                text = str(item[0]).strip()
+            elif len(item) >= 2:
+                text = str(item[1]).strip()
+            else:
+                continue
+            match = LATENCY_MS_RE.search(text.replace('毫秒', 'ms'))
+            if not match:
+                continue
+            value = int(match.group(1))
+            if 1 <= value <= MAX_PLAUSIBLE_LATENCY_MS:
+                return value
+        return -4
+
     def sample_once(self) -> dict:
         """执行一次采样"""
         timestamp = datetime.now()
@@ -1518,7 +1596,7 @@ class QoEMonitor:
         
         trust_stall, stall_reason = self.detect_stall(current_similarity, pixel_diff, screenshot_path_str, page_type=page_type)
         
-        rtt = -4
+        rtt = self._detect_latency_ms(screenshot_path_str) if screenshot_success else -4
         
         data = {
             'file_name': self.pcap_name,

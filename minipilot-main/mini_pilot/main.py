@@ -1031,6 +1031,7 @@ def _maybe_start_capture(
         args.capture_pcap_app_package
         or custom_package
         or str(capture_settings.get("pcap_app_package") or "")
+        or (get_package(app_name) if args.capture_app else "")
         or str(inferred.get("package") or "")
         or get_package(app_name)
     )

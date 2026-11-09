@@ -1619,6 +1619,10 @@ class AppCollector:
             
             # 根据APP类型自动调整卡顿阈值
             threshold = 92.0 if self.app_config.app_type == 'video' else 95.0
+            stall_window = 3
+            if self.app_config.name == 'honorofkings':
+                threshold = 99.2
+                stall_window = 4
             
             try:
                 self.qoe_monitor = qm_module.QoEMonitor(
@@ -1630,7 +1634,7 @@ class AppCollector:
                     app_name=self.app_config.name,
                     scene=self.scene_config.name,
                     warmup_seconds=10,
-                    stall_window=3,
+                    stall_window=stall_window,
                     register_signal=False,  # 由主线程处理信号
                     csv_path=str(qoe_csv_path)
                 )

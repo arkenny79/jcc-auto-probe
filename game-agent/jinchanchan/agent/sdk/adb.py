@@ -86,8 +86,9 @@ class EasyOcrEngine:
 class AdbOCR:
     """ADB 连接 + 截图 + 点击 + OCR 基础能力"""
 
-    def __init__(self):
+    def __init__(self, transport=None):
         self._device = None
+        self._transport = transport  # AdbBinaryTransport(王者形式); None 时用 adb_shell TCP
         self.ocr_engine = None
         self._random = random.Random()
         self.connected_host = None
@@ -103,7 +104,18 @@ class AdbOCR:
         await task2
 
     async def connect_only(self, port, host="localhost", scan_if_fail=True):
-        """只做设备连接, 失败抛 ConnectionError(供启动重试场景使用)"""
+        """只做设备连接, 失败抛 ConnectionError(供启动重试场景使用)
+
+        transport 模式(王者形式): 通过 adb 二进制 + serial 连接, port/host 参数忽略。
+        """
+        if self._transport is not None:
+            if self._transport.connect():
+                self.connected_host, self.connected_port = "adb-bin", None
+                logger.info(f"[SDK] 已连接设备 serial={self._transport.connected_serial}")
+                return
+            raise ConnectionError(
+                f"无法连接设备(adb 二进制形式, serial={self._transport.serial or '自动'}), "
+                f"请确认手机已 USB 连接并开启 USB 调试")
         await self._connect_device(port=port, host=host, scan_if_fail=scan_if_fail)
         if self.connected_port is None:
             raise ConnectionError(
@@ -178,9 +190,13 @@ class AdbOCR:
         self.ensure_ocr_engine(languages)
 
     def is_connected(self):
+        if self._transport is not None:
+            return self._transport.is_connected()
         return self._device is not None and self._device.available
 
     async def close(self):
+        if self._transport is not None:
+            return
         if self._device is not None:
             try:
                 await self._device.close()
@@ -192,6 +208,8 @@ class AdbOCR:
 
     async def get_screen_size(self):
         """返回 (width, height) 设备分辨率"""
+        if self._transport is not None:
+            return self._transport.get_screen_size()
         if not self.is_connected():
             return 0, 0
         output = await self._device.shell("wm size")
@@ -202,7 +220,13 @@ class AdbOCR:
         return 0, 0
 
     async def get_screen_density(self):
-        output = await self._device.shell("wm density")
+        if self._transport is not None:
+            ok, output = await asyncio.to_thread(self._transport.shell, "wm density")
+            if not ok:
+                return 0
+            output = output.decode("utf-8", "replace")
+        else:
+            output = await self._device.shell("wm density")
         matches = re.findall(r"(\d+)", output)
         return int(matches[-1]) if matches else 0
 
@@ -221,6 +245,12 @@ class AdbOCR:
 
     async def get_screen(self):
         """截取设备屏幕(灰度图), 失败自动重连一次, 仍失败返回 None"""
+        if self._transport is not None:
+            if not self._transport.is_connected():
+                self._transport.connect()
+                return None
+            return await asyncio.to_thread(self._transport.screenshot)
+
         if not self.is_connected():
             await self._try_reconnect()
             return None
@@ -237,6 +267,9 @@ class AdbOCR:
 
     async def _try_reconnect(self):
         """断线后尝试重建连接(模拟器重启/游戏重开后自动恢复)"""
+        if self._transport is not None:
+            self._transport.connect()
+            return
         if not self.connected_port:
             return
         try:
@@ -251,6 +284,9 @@ class AdbOCR:
 
     async def click(self, x, y):
         """点击(短 swipe 模拟, 带随机时长), 失败仅告警不抛异常"""
+        if self._transport is not None:
+            await asyncio.to_thread(self._transport.tap, x, y)
+            return
         try:
             async with self._adb_lock:
                 await self._device.shell(
@@ -261,6 +297,9 @@ class AdbOCR:
             await self._try_reconnect()
 
     async def swipe(self, x1, y1, x2, y2, duration=None):
+        if self._transport is not None:
+            await asyncio.to_thread(self._transport.swipe, x1, y1, x2, y2, duration)
+            return
         try:
             async with self._adb_lock:
                 await self._device.shell(
@@ -272,6 +311,9 @@ class AdbOCR:
             await self._try_reconnect()
 
     async def go_back(self):
+        if self._transport is not None:
+            await asyncio.to_thread(self._transport.keyevent, 4)
+            return
         try:
             async with self._adb_lock:
                 await self._device.shell("input keyevent 4")

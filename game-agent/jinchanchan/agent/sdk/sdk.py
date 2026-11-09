@@ -20,8 +20,10 @@ from utils.logger import logger
 
 
 class Sdk(AdbOCR):
-    def __init__(self):
-        super().__init__()
+    def __init__(self, transport=None):
+        """transport: 可选 AdbBinaryTransport(王者形式, adb 二进制+serial);
+        不传则用默认的 adb_shell TCP 形式(雷电模拟器 5555)。"""
+        super().__init__(transport=transport)
         self.scaler = None
         self.reader = None
         self.control = None

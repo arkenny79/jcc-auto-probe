@@ -32,6 +32,7 @@ from datetime import datetime
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from agent.sdk import Sdk
+from agent.sdk.adb_bin import AdbBinaryTransport
 from agent.sdk.stages import StageDetector, Stage
 from agent.sdk.qmark import QuestionMarkDetector
 from agent.sdk.banner import (BannerDetector, KIND_PREPARE, KIND_BATTLE,
@@ -540,24 +541,38 @@ def _build_parser():
     parser.add_argument("--run-id", help="外部总控生成的运行标识")
     parser.add_argument("--dry-run", action="store_true", help="只识别不操作")
     parser.add_argument("--max-rounds", type=int, default=99)
+    parser.add_argument("--adb-bin", action="store_true",
+                        help="通过 adb 二进制和设备 serial 连接, 支持 USB 真机/模拟器")
+    parser.add_argument("--serial", default=None,
+                        help="ADB 设备序列号; 与 --adb-bin 配合使用, 缺省自动选择")
+    parser.add_argument("--adb-path", default="adb",
+                        help="adb 可执行文件路径, 如 D:/leidian/LDPlayer14/adb.exe")
     return parser
 
 
 async def _connect_sdk(sdk, endpoint, external_mode):
-    scan_if_fail = endpoint.host in ("localhost", "127.0.0.1")
-    print("[AUTO] 连接雷电模拟器 %s ..." % endpoint.device_id)
+    transport = getattr(sdk, "_transport", None)
+    if endpoint is None:
+        host, port = "localhost", 5555
+        target = "serial=%s" % (transport.serial or "自动发现")
+        scan_if_fail = False
+    else:
+        host, port = endpoint.host, endpoint.port
+        target = endpoint.device_id
+        scan_if_fail = endpoint.host in ("localhost", "127.0.0.1", "::1")
+    print("[AUTO] 连接设备 %s ..." % target)
     while True:
         try:
             await sdk.connect_only(
-                port=endpoint.port,
-                host=endpoint.host,
+                port=port,
+                host=host,
                 scan_if_fail=scan_if_fail,
             )
             return
         except Exception as exc:  # noqa: BLE001
             if external_mode:
                 raise ConnectionError(
-                    f"无法连接设备 {endpoint.device_id}: {exc}"
+                    f"无法连接设备 {target}: {exc}"
                 ) from exc
             print("[AUTO] 连接失败(%s), 10秒后重试..." % exc)
             await asyncio.sleep(10)
@@ -593,7 +608,11 @@ async def _wait_driver_or_abort(driver, guard):
 
 
 async def _run_application(args, endpoint, events):
-    sdk = Sdk()
+    transport = (
+        AdbBinaryTransport(adb_path=args.adb_path, serial=args.serial)
+        if args.adb_bin else None
+    )
+    sdk = Sdk(transport=transport)
     driver = None
     try:
         try:
@@ -606,10 +625,12 @@ async def _run_application(args, endpoint, events):
 
         size = sdk.scaler.device_size
         density = await sdk.get_screen_density()
+        binding_mode = "adb_serial" if args.adb_bin else "adb_tcp"
+        device_id = sdk._transport.connected_serial if args.adb_bin else endpoint.device_id
         events.emit(
             "DEVICE_READY",
-            device_id=endpoint.device_id,
-            binding_mode="adb_tcp",
+            device_id=device_id,
+            binding_mode=binding_mode,
             resolution=f"{size[0]}x{size[1]}",
             dpi=density,
         )
@@ -660,14 +681,21 @@ def main():
     args = parser.parse_args()
 
     try:
-        endpoint = resolve_device_endpoint(args.device_id, args.host, args.port)
+        if args.adb_bin:
+            if args.device_id is not None or args.host is not None or args.port is not None:
+                parser.error("--adb-bin 不能与 --device-id/--host/--port 同时使用")
+            endpoint = None
+        else:
+            if args.serial is not None or args.adb_path != "adb":
+                parser.error("--serial 和 --adb-path 需要配合 --adb-bin 使用")
+            endpoint = resolve_device_endpoint(args.device_id, args.host, args.port)
     except ValueError as exc:
         parser.error(str(exc))
 
     if args.timeout is not None and args.timeout <= 0:
         parser.error("--timeout 必须大于 0")
     if args.mode == "external":
-        if args.device_id is None and args.host is None and args.port is None:
+        if not args.adb_bin and args.device_id is None and args.host is None and args.port is None:
             parser.error("external 模式必须指定 --device-id 或 --host/--port")
         missing = [
             name for name, value in (
@@ -679,12 +707,17 @@ def main():
         if missing:
             parser.error("external 模式缺少参数: %s" % ", ".join(missing))
 
+    requested_device_id = (
+        "serial:%s" % (args.serial or "auto")
+        if args.adb_bin else endpoint.device_id
+    )
+    binding_mode = "adb_serial" if args.adb_bin else "adb_tcp"
     events = EventWriter(args.event_file, run_id=args.run_id)
     events.emit(
         "SCRIPT_STARTED",
         mode=args.mode,
-        device_id=endpoint.device_id,
-        binding_mode="adb_tcp",
+        device_id=requested_device_id,
+        binding_mode=binding_mode,
         dry_run=args.dry_run,
     )
     try:
